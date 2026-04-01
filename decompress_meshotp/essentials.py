@@ -1,12 +1,13 @@
 from pathlib import Path
 from typing import Any
 import json
-import os
 import shutil
 import struct
-import subprocess
 
 import bpy
+
+from . import standalone_gltf
+from .scripts.decode_meshopt import decode_file as decode_meshopt_file
 
 
 def get_classes(modules: tuple[Any]) -> tuple[type]:
@@ -57,35 +58,8 @@ def check_integrity(path: Path) -> None:
         raise FileNotFoundError("Incorrect package, follow installation guide")
 
 
-def get_gltf_transform_command() -> tuple[list[str] | None, str]:
-    """Resolve gltf-transform the same way as the backend: binary first, npx fallback."""
-    gltf_transform = shutil.which("gltf-transform")
-    if gltf_transform:
-        return [gltf_transform], gltf_transform
-
-    npx = shutil.which("npx")
-    if npx:
-        if os.name == "nt":
-            return ["cmd", "/c", "npx", "--yes", "@gltf-transform/cli"], "npx @gltf-transform/cli"
-        return [npx, "--yes", "@gltf-transform/cli"], "npx @gltf-transform/cli"
-
-    return None, "missing"
-
-
-def run_gltf_transform(input_path: Path, output_path: Path, command_name: str) -> None:
-    command, display_name = get_gltf_transform_command()
-
-    if command is None:
-        raise FileNotFoundError(
-            "gltf-transform is not available. Install '@gltf-transform/cli' globally "
-            "or make 'npx' available in Blender's environment."
-        )
-
-    cmd = [*command, command_name, str(input_path), str(output_path)]
-    result = subprocess.run(cmd, capture_output=True, text=True, check=False)
-    if result.returncode != 0:
-        details = (result.stderr or result.stdout or "Unknown error").strip()
-        raise RuntimeError(f"{display_name} {command_name} failed: {details}")
+def run_meshopt_decoder(input_path: Path, output_path: Path) -> None:
+    decode_meshopt_file(input_path, output_path)
 
 
 def _load_gltf_json(input_path: Path) -> dict[str, Any]:
@@ -137,26 +111,41 @@ def describe_import_extensions(input_path: Path) -> str:
     return ", ".join(labels)
 
 
-def normalize_model_for_import(input_path: Path, output_path: Path) -> None:
-    """Normalize Draco, Meshopt, and quantized geometry into a Blender-readable GLB."""
+def can_normalize_with_python(input_path: Path) -> bool:
     extensions = detect_compression_extensions(input_path)
-    needs_geometry_decode = bool(
-        {"KHR_draco_mesh_compression", "EXT_meshopt_compression", "KHR_mesh_quantization"} & extensions
-    )
+    return DRACO_EXTENSION not in extensions
+
+
+DRACO_EXTENSION = "KHR_draco_mesh_compression"
+
+
+def describe_import_backend(input_path: Path) -> str:
+    extensions = detect_compression_extensions(input_path)
+    if "EXT_meshopt_compression" in extensions:
+        return "standalone Python"
+    if DRACO_EXTENSION in extensions:
+        return "unsupported Draco"
+    return "standalone Python"
+
+
+def normalize_model_for_import(input_path: Path, output_path: Path) -> Path:
+    """Normalize Meshopt and quantized geometry into a Blender-readable glTF asset."""
+    extensions = detect_compression_extensions(input_path)
+    needs_geometry_decode = bool({DRACO_EXTENSION, "EXT_meshopt_compression", "KHR_mesh_quantization"} & extensions)
 
     if not needs_geometry_decode:
-        if input_path.suffix.lower() == ".glb":
+        if input_path.suffix.lower() == output_path.suffix.lower() == ".glb":
             shutil.copy2(input_path, output_path)
+            return output_path
         else:
-            run_gltf_transform(input_path, output_path, "copy")
-        return
+            return standalone_gltf.normalize_model_for_import(input_path, output_path)
 
-    current_path = input_path
-    if needs_geometry_decode:
-        dequantized_path = output_path.with_name(f"{output_path.stem}_dequantized.glb")
-        run_gltf_transform(current_path, dequantized_path, "dequantize")
-        current_path = dequantized_path
+    if "EXT_meshopt_compression" not in extensions and DRACO_EXTENSION not in extensions:
+        return standalone_gltf.normalize_model_for_import(input_path, output_path)
 
-    # Rewriting the file after dequantization expands accessor/layout details that
-    # Blender still trips over on some Draco and Meshopt exports.
-    run_gltf_transform(current_path, output_path, "dedup")
+    if "EXT_meshopt_compression" in extensions:
+        decoded_path = output_path.with_name(f"{output_path.stem}_meshopt_decoded.gltf")
+        run_meshopt_decoder(input_path, decoded_path)
+        return standalone_gltf.normalize_model_for_import(decoded_path, output_path)
+
+    raise RuntimeError("Draco-compressed files are not supported by this addon.")

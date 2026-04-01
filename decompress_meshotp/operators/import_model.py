@@ -14,7 +14,7 @@ from .. import essentials
 class IMPORT_SCENE_OT_dequantize_gltf(Operator, ImportHelper):
     bl_idname = "import_scene.dequantize_gltf"
     bl_label = "Import GLTF/GLB (Meshopt)"
-    bl_description = "Decompress Draco and Meshopt geometry with gltf-transform before importing"
+    bl_description = "Normalize Meshopt and quantized geometry before importing"
     bl_options = {"REGISTER", "UNDO"}
 
     filename_ext = ".glb"
@@ -49,21 +49,22 @@ class IMPORT_SCENE_OT_dequantize_gltf(Operator, ImportHelper):
             self.report({"ERROR"}, f"Input file not found: {source_path}")
             return {"CANCELLED"}
 
-        command, display_name = essentials.get_gltf_transform_command()
-        if command is None:
+        extensions = essentials.detect_compression_extensions(source_path)
+        if essentials.DRACO_EXTENSION in extensions:
             self.report(
                 {"ERROR"},
-                "Missing gltf-transform tooling. Install '@gltf-transform/cli' or ensure 'npx' is available.",
+                "Draco-compressed files are not supported by this addon.",
             )
             return {"CANCELLED"}
 
         compression_label = essentials.describe_import_extensions(source_path)
         temp_dir = Path(tempfile.mkdtemp(prefix="decompress_draco_meshopt_"))
-        normalized_path = temp_dir / f"{source_path.stem}_normalized.glb"
-        self._display_name = display_name
+        normalized_path = temp_dir / f"{source_path.stem}_normalized{source_path.suffix.lower()}"
+        self._display_name = essentials.describe_import_backend(source_path)
         self._compression_label = compression_label
         self._temp_dir = temp_dir
         self._normalized_path = normalized_path
+        self._import_path = normalized_path
         self._error = None
         self._result = {"RUNNING_MODAL"}
         self._worker = threading.Thread(
@@ -74,12 +75,12 @@ class IMPORT_SCENE_OT_dequantize_gltf(Operator, ImportHelper):
         self._timer = context.window_manager.event_timer_add(0.2, window=context.window)
         context.window_manager.modal_handler_add(self)
         self._worker.start()
-        self.report({"INFO"}, f"Preparing {source_path.name} ({compression_label}) with {display_name}...")
+        self.report({"INFO"}, f"Preparing {source_path.name} ({compression_label}) with {self._display_name}...")
         return {"RUNNING_MODAL"}
 
     def _normalize_in_background(self, source_path, normalized_path):
         try:
-            essentials.normalize_model_for_import(source_path, normalized_path)
+            self._import_path = essentials.normalize_model_for_import(source_path, normalized_path)
         except Exception as exc:
             self._error = str(exc)
 
@@ -94,11 +95,11 @@ class IMPORT_SCENE_OT_dequantize_gltf(Operator, ImportHelper):
                 self._result = {"CANCELLED"}
                 return
 
-            bpy.ops.import_scene.gltf(filepath=str(self._normalized_path))
+            bpy.ops.import_scene.gltf(filepath=str(self._import_path))
             self.report({"INFO"}, f"Imported {self._compression_label} model via {self._display_name}")
             self._result = {"FINISHED"}
         finally:
             if self.keep_dequantized_file:
-                self.report({"INFO"}, f"Temporary GLB kept at {self._normalized_path}")
+                self.report({"INFO"}, f"Temporary normalized asset kept at {self._import_path}")
             else:
                 shutil.rmtree(self._temp_dir, ignore_errors=True)
