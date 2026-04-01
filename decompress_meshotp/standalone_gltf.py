@@ -9,6 +9,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, TypeVar
 
+import numpy as np
+
 
 GLB_JSON_CHUNK = 0x4E4F534A
 GLB_BIN_CHUNK = 0x004E4942
@@ -29,6 +31,15 @@ COMPONENT_TYPE_SIZE = {
     5123: 2,
     5125: 4,
     5126: 4,
+}
+
+COMPONENT_TYPE_DTYPE = {
+    5120: np.int8,
+    5121: np.uint8,
+    5122: np.int16,
+    5123: np.uint16,
+    5125: np.uint32,
+    5126: np.float32,
 }
 
 TYPE_COMPONENTS = {
@@ -240,7 +251,7 @@ def materialize_accessor(document: GLTFDocument, accessor_index: int, dequantize
     normalized = bool(source.get("normalized"))
 
     if dequantize:
-        flattened = [decode_normalized(value, component_type) if normalized else float(value) for value in values]
+        flattened = decode_normalized_array(values, component_type) if normalized else values.astype(np.float32, copy=False)
         component_type = 5126
         normalized = False
         blob = pack_values(flattened, component_type)
@@ -258,25 +269,31 @@ def materialize_accessor(document: GLTFDocument, accessor_index: int, dequantize
     return AccessorPayload(accessor=source, blob=blob)
 
 
-def read_accessor_values(document: GLTFDocument, accessor: dict[str, Any]) -> list[float | int]:
+def read_accessor_values(document: GLTFDocument, accessor: dict[str, Any]) -> np.ndarray:
     component_type = accessor["componentType"]
     component_count = TYPE_COMPONENTS[accessor["type"]]
     component_size = COMPONENT_TYPE_SIZE[component_type]
     element_size = component_count * component_size
     count = accessor["count"]
+    dtype = COMPONENT_TYPE_DTYPE[component_type]
 
     if "bufferView" in accessor:
         buffer_view = document.json_data["bufferViews"][accessor["bufferView"]]
         raw = read_buffer_view(document, accessor["bufferView"])
         stride = buffer_view.get("byteStride", element_size)
         offset = accessor.get("byteOffset", 0)
-        values = []
-        for index in range(count):
-            start = offset + index * stride
-            chunk = raw[start : start + element_size]
-            values.extend(unpack_values(chunk, component_type, component_count))
+        if stride == element_size:
+            values = np.frombuffer(raw, dtype=dtype, count=count * component_count, offset=offset).copy()
+        else:
+            values = np.ndarray(
+                shape=(count, component_count),
+                dtype=dtype,
+                buffer=raw,
+                offset=offset,
+                strides=(stride, component_size),
+            ).copy().reshape(-1)
     else:
-        values = [0] * (count * component_count)
+        values = np.zeros(count * component_count, dtype=dtype)
 
     sparse = accessor.get("sparse")
     if sparse:
@@ -287,7 +304,7 @@ def read_accessor_values(document: GLTFDocument, accessor: dict[str, Any]) -> li
 
 def apply_sparse_values(
     document: GLTFDocument,
-    values: list[float | int],
+    values: np.ndarray,
     accessor: dict[str, Any],
     sparse: dict[str, Any],
 ) -> None:
@@ -298,7 +315,7 @@ def apply_sparse_values(
     index_buffer_view = sparse["indices"]["bufferView"]
     index_offset = sparse["indices"].get("byteOffset", 0)
     index_blob = read_buffer_view(document, index_buffer_view)[index_offset : index_offset + sparse_count * COMPONENT_TYPE_SIZE[index_component_type]]
-    indices = unpack_values(index_blob, index_component_type, sparse_count)
+    indices = np.frombuffer(index_blob, dtype=COMPONENT_TYPE_DTYPE[index_component_type], count=sparse_count)
 
     value_component_type = accessor["componentType"]
     value_buffer_view = sparse["values"]["bufferView"]
@@ -306,14 +323,14 @@ def apply_sparse_values(
     value_blob = read_buffer_view(document, value_buffer_view)[
         value_offset : value_offset + sparse_count * component_count * COMPONENT_TYPE_SIZE[value_component_type]
     ]
-    sparse_values = unpack_values(value_blob, value_component_type, sparse_count * component_count)
+    sparse_values = np.frombuffer(
+        value_blob,
+        dtype=COMPONENT_TYPE_DTYPE[value_component_type],
+        count=sparse_count * component_count,
+    ).reshape(sparse_count, component_count)
 
-    for sparse_index, accessor_index in enumerate(indices):
-        accessor_index = int(accessor_index)
-        start = accessor_index * component_count
-        values[start : start + component_count] = sparse_values[
-            sparse_index * component_count : (sparse_index + 1) * component_count
-        ]
+    reshaped = values.reshape(-1, component_count)
+    reshaped[indices.astype(np.int64)] = sparse_values
 
 
 def read_buffer_view(document: GLTFDocument, buffer_view_index: int) -> bytes:
@@ -325,18 +342,10 @@ def read_buffer_view(document: GLTFDocument, buffer_view_index: int) -> bytes:
     return buffer_bytes[start:end]
 
 
-def unpack_values(blob: bytes, component_type: int, value_count: int) -> list[float | int]:
-    if value_count == 0:
-        return []
-    fmt = "<" + COMPONENT_TYPE_FORMAT[component_type] * value_count
-    return list(struct.unpack(fmt, blob[: struct.calcsize(fmt)]))
-
-
-def pack_values(values: list[float | int], component_type: int) -> bytes:
-    if not values:
+def pack_values(values: np.ndarray, component_type: int) -> bytes:
+    if values.size == 0:
         return b""
-    fmt = "<" + COMPONENT_TYPE_FORMAT[component_type] * len(values)
-    return struct.pack(fmt, *values)
+    return np.asarray(values, dtype=COMPONENT_TYPE_DTYPE[component_type]).tobytes()
 
 
 def decode_normalized(value: float | int, component_type: int) -> float:
@@ -353,24 +362,38 @@ def decode_normalized(value: float | int, component_type: int) -> float:
     return float(value)
 
 
-def update_accessor_bounds(accessor: dict[str, Any], values: list[float | int]) -> None:
+def decode_normalized_array(values: np.ndarray, component_type: int) -> np.ndarray:
+    values = values.astype(np.float32, copy=False)
+    if component_type == 5120:
+        return np.maximum(values / 127.0, -1.0)
+    if component_type == 5121:
+        return values / 255.0
+    if component_type == 5122:
+        return np.maximum(values / 32767.0, -1.0)
+    if component_type == 5123:
+        return values / 65535.0
+    if component_type == 5125:
+        return values / 4294967295.0
+    return values.astype(np.float32, copy=False)
+
+
+def update_accessor_bounds(accessor: dict[str, Any], values: np.ndarray) -> None:
     component_count = TYPE_COMPONENTS[accessor["type"]]
     if accessor["count"] == 0 or component_count == 0:
         accessor.pop("min", None)
         accessor.pop("max", None)
         return
 
-    mins = [math.inf] * component_count
-    maxes = [-math.inf] * component_count
-    for index in range(accessor["count"]):
-        start = index * component_count
-        for component in range(component_count):
-            value = values[start + component]
-            mins[component] = min(mins[component], value)
-            maxes[component] = max(maxes[component], value)
+    reshaped = values.reshape(accessor["count"], component_count)
+    mins = reshaped.min(axis=0)
+    maxes = reshaped.max(axis=0)
 
-    accessor["min"] = [float(value) if accessor["componentType"] == 5126 else int(value) for value in mins]
-    accessor["max"] = [float(value) if accessor["componentType"] == 5126 else int(value) for value in maxes]
+    if accessor["componentType"] == 5126:
+        accessor["min"] = mins.astype(np.float32).tolist()
+        accessor["max"] = maxes.astype(np.float32).tolist()
+    else:
+        accessor["min"] = mins.astype(np.int64).tolist()
+        accessor["max"] = maxes.astype(np.int64).tolist()
 
 
 def dedup_accessors(
