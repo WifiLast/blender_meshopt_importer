@@ -57,7 +57,7 @@ DRACO_EXTENSION = "KHR_draco_mesh_compression"
 @dataclass
 class GLTFDocument:
     json_data: dict[str, Any]
-    buffers: list[bytes]
+    buffers: list[bytes | bytearray]
     base_dir: Path
     images_to_write: list[tuple[str, bytes]] = field(default_factory=list)
 
@@ -70,6 +70,10 @@ class AccessorPayload:
 
 def normalize_model_for_import(input_path: Path, output_path: Path) -> Path:
     document = load_document(input_path)
+    return normalize_document_for_import(document, output_path)
+
+
+def normalize_document_for_import(document: GLTFDocument, output_path: Path) -> Path:
     ensure_meshopt_is_decoded(document.json_data)
 
     strip_extension(document.json_data, MESHOPT_EXTENSION)
@@ -685,6 +689,7 @@ def align_buffer(buffer_blob: bytearray, alignment: int) -> None:
 
 def write_gltf(document: GLTFDocument, output_path: Path) -> Path:
     output_path = output_path.with_suffix(".gltf")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     buffer_blob = document.json_data.pop("_standalone_buffer_blob", b"")
     buffer_name = document.json_data["buffers"][0]["uri"] if document.json_data.get("buffers") else "scene.bin"
 

@@ -5,14 +5,23 @@ from __future__ import annotations
 import base64
 import json
 import math
-import struct
 import sys
+from dataclasses import dataclass
 from pathlib import Path
+
+import numpy as np
 
 
 GLB_JSON_CHUNK = 0x4E4F534A
 GLB_BIN_CHUNK = 0x004E4942
 EXTENSION_NAME = "EXT_meshopt_compression"
+
+
+@dataclass
+class MeshoptAsset:
+    json_doc: dict
+    buffers: list[bytearray]
+    base_dir: Path
 
 
 def assert_true(condition: bool, message: str = "Assertion failed") -> None:
@@ -191,71 +200,61 @@ def decode_vertex_buffer(target: bytearray, element_count: int, byte_stride: int
 def apply_octahedral_filter(target: bytearray, element_count: int, byte_stride: int) -> None:
     assert_true(byte_stride in (4, 8))
     if byte_stride == 4:
-        values = list(struct.unpack("<" + "b" * (element_count * 4), target))
-        max_int = 127
-        for index in range(0, element_count * 4, 4):
-            x = values[index + 0]
-            y = values[index + 1]
-            one = values[index + 2]
-            x /= one
-            y /= one
-            z = 1.0 - abs(x) - abs(y)
-            t = max(-z, 0.0)
-            x -= t if x >= 0 else -t
-            y -= t if y >= 0 else -t
-            h = max_int / math.hypot(x, y, z)
-            values[index + 0] = round(x * h)
-            values[index + 1] = round(y * h)
-            values[index + 2] = round(z * h)
-        target[:] = struct.pack("<" + "b" * len(values), *values)
+        values = np.frombuffer(target, dtype=np.int8).reshape(element_count, 4)
+        max_int = 127.0
+        xy = values[:, :2].astype(np.float32)
+        one = values[:, 2].astype(np.float32)
+        safe_one = np.where(one == 0, 1.0, one)
+        xy = xy / safe_one[:, None]
+        z = 1.0 - np.abs(xy[:, 0]) - np.abs(xy[:, 1])
+        t = np.maximum(-z, 0.0)
+        xy[:, 0] -= np.where(xy[:, 0] >= 0, t, -t)
+        xy[:, 1] -= np.where(xy[:, 1] >= 0, t, -t)
+        h = max_int / np.sqrt(xy[:, 0] ** 2 + xy[:, 1] ** 2 + z**2)
+        values[:, 0] = np.rint(xy[:, 0] * h).astype(np.int8)
+        values[:, 1] = np.rint(xy[:, 1] * h).astype(np.int8)
+        values[:, 2] = np.rint(z * h).astype(np.int8)
         return
 
-    values = list(struct.unpack("<" + "h" * (element_count * 4), target))
-    max_int = 32767
-    for index in range(0, element_count * 4, 4):
-        x = values[index + 0]
-        y = values[index + 1]
-        one = values[index + 2]
-        x /= one
-        y /= one
-        z = 1.0 - abs(x) - abs(y)
-        t = max(-z, 0.0)
-        x -= t if x >= 0 else -t
-        y -= t if y >= 0 else -t
-        h = max_int / math.hypot(x, y, z)
-        values[index + 0] = round(x * h)
-        values[index + 1] = round(y * h)
-        values[index + 2] = round(z * h)
-    target[:] = struct.pack("<" + "h" * len(values), *values)
+    values = np.frombuffer(target, dtype=np.int16).reshape(element_count, 4)
+    max_int = 32767.0
+    xy = values[:, :2].astype(np.float32)
+    one = values[:, 2].astype(np.float32)
+    safe_one = np.where(one == 0, 1.0, one)
+    xy = xy / safe_one[:, None]
+    z = 1.0 - np.abs(xy[:, 0]) - np.abs(xy[:, 1])
+    t = np.maximum(-z, 0.0)
+    xy[:, 0] -= np.where(xy[:, 0] >= 0, t, -t)
+    xy[:, 1] -= np.where(xy[:, 1] >= 0, t, -t)
+    h = max_int / np.sqrt(xy[:, 0] ** 2 + xy[:, 1] ** 2 + z**2)
+    values[:, 0] = np.rint(xy[:, 0] * h).astype(np.int16)
+    values[:, 1] = np.rint(xy[:, 1] * h).astype(np.int16)
+    values[:, 2] = np.rint(z * h).astype(np.int16)
 
 
 def apply_quaternion_filter(target: bytearray, element_count: int) -> None:
-    values = list(struct.unpack("<" + "h" * (element_count * 4), target))
-    for index in range(0, element_count * 4, 4):
-        input_w = values[index + 3]
-        max_component = input_w & 0x03
-        scale = math.sqrt(0.5) / (input_w | 0x03)
-        x = values[index + 0] * scale
-        y = values[index + 1] * scale
-        z = values[index + 2] * scale
-        w = math.sqrt(max(0.0, 1.0 - x**2 - y**2 - z**2))
-        values[index + ((max_component + 1) % 4)] = round(x * 32767)
-        values[index + ((max_component + 2) % 4)] = round(y * 32767)
-        values[index + ((max_component + 3) % 4)] = round(z * 32767)
-        values[index + ((max_component + 0) % 4)] = round(w * 32767)
-    target[:] = struct.pack("<" + "h" * len(values), *values)
+    values = np.frombuffer(target, dtype=np.int16).reshape(element_count, 4)
+    input_w = values[:, 3].astype(np.int32)
+    max_component = input_w & 0x03
+    scale = np.float32(math.sqrt(0.5)) / (input_w | 0x03)
+    xyz = values[:, :3].astype(np.float32) * scale[:, None]
+    w = np.sqrt(np.maximum(0.0, 1.0 - np.sum(xyz**2, axis=1)))
+    output = np.empty_like(values)
+    row_indices = np.arange(element_count)
+    output[row_indices, (max_component + 0) % 4] = np.rint(w * 32767).astype(np.int16)
+    output[row_indices, (max_component + 1) % 4] = np.rint(xyz[:, 0] * 32767).astype(np.int16)
+    output[row_indices, (max_component + 2) % 4] = np.rint(xyz[:, 1] * 32767).astype(np.int16)
+    output[row_indices, (max_component + 3) % 4] = np.rint(xyz[:, 2] * 32767).astype(np.int16)
+    values[:, :] = output
 
 
 def apply_exponential_filter(target: bytearray, element_count: int, byte_stride: int) -> None:
     assert_true((byte_stride & 0x03) == 0)
-    value_count = (byte_stride * element_count) // 4
-    ints = struct.unpack("<" + "i" * value_count, target)
-    floats = []
-    for value in ints:
-        exponent = value >> 24
-        mantissa = (value << 8) >> 8
-        floats.append((2.0**exponent) * mantissa)
-    target[:] = struct.pack("<" + "f" * len(floats), *floats)
+    ints = np.frombuffer(target, dtype=np.int32)
+    exponents = ints >> 24
+    mantissas = (ints << 8) >> 8
+    floats = np.power(np.float32(2.0), exponents.astype(np.float32)) * mantissas.astype(np.float32)
+    target[:] = floats.astype(np.float32).tobytes()
 
 
 def apply_color_filter(target: bytearray, element_count: int, byte_stride: int) -> None:
@@ -263,50 +262,48 @@ def apply_color_filter(target: bytearray, element_count: int, byte_stride: int) 
     max_int = (1 << (byte_stride * 2)) - 1
 
     if byte_stride == 4:
-        data = list(target)
-        signed = list(struct.unpack("<" + "b" * len(target), target))
-        for index in range(0, element_count * 4, 4):
-            y = data[index + 0]
-            co = signed[index + 1]
-            cg = signed[index + 2]
-            alpha_input = data[index + 3]
-
-            alpha_bit = alpha_input.bit_length() - 1
-            alpha_scale = (1 << (alpha_bit + 1)) - 1 if alpha_input else 1
-            r = y + co - cg
-            g = y + cg
-            b = y - co - cg
-            a = alpha_input & (alpha_scale >> 1)
-            a = (a << 1) | (a & 1)
-            scale = max_int / alpha_scale
-            data[index + 0] = round(r * scale)
-            data[index + 1] = round(g * scale)
-            data[index + 2] = round(b * scale)
-            data[index + 3] = round(a * scale)
-        target[:] = bytes(data)
-        return
-
-    data = list(struct.unpack("<" + "H" * (element_count * 4), target))
-    signed = list(struct.unpack("<" + "h" * (element_count * 4), target))
-    for index in range(0, element_count * 4, 4):
-        y = data[index + 0]
-        co = signed[index + 1]
-        cg = signed[index + 2]
-        alpha_input = data[index + 3]
-
-        alpha_bit = alpha_input.bit_length() - 1
-        alpha_scale = (1 << (alpha_bit + 1)) - 1 if alpha_input else 1
+        data = np.frombuffer(target, dtype=np.uint8).reshape(element_count, 4)
+        signed = np.frombuffer(target, dtype=np.int8).reshape(element_count, 4)
+        y = data[:, 0].astype(np.int32)
+        co = signed[:, 1].astype(np.int32)
+        cg = signed[:, 2].astype(np.int32)
+        alpha_input = data[:, 3].astype(np.int32)
+        alpha_bits = np.zeros_like(alpha_input)
+        non_zero = alpha_input > 0
+        alpha_bits[non_zero] = np.floor(np.log2(alpha_input[non_zero])).astype(np.int32)
+        alpha_scale = np.where(alpha_input > 0, (1 << (alpha_bits + 1)) - 1, 1)
         r = y + co - cg
         g = y + cg
         b = y - co - cg
         a = alpha_input & (alpha_scale >> 1)
         a = (a << 1) | (a & 1)
-        scale = max_int / alpha_scale
-        data[index + 0] = round(r * scale)
-        data[index + 1] = round(g * scale)
-        data[index + 2] = round(b * scale)
-        data[index + 3] = round(a * scale)
-    target[:] = struct.pack("<" + "H" * len(data), *data)
+        scale = max_int / alpha_scale.astype(np.float32)
+        data[:, 0] = np.rint(r * scale).clip(0, max_int).astype(np.uint8)
+        data[:, 1] = np.rint(g * scale).clip(0, max_int).astype(np.uint8)
+        data[:, 2] = np.rint(b * scale).clip(0, max_int).astype(np.uint8)
+        data[:, 3] = np.rint(a * scale).clip(0, max_int).astype(np.uint8)
+        return
+
+    data = np.frombuffer(target, dtype=np.uint16).reshape(element_count, 4)
+    signed = np.frombuffer(target, dtype=np.int16).reshape(element_count, 4)
+    y = data[:, 0].astype(np.int32)
+    co = signed[:, 1].astype(np.int32)
+    cg = signed[:, 2].astype(np.int32)
+    alpha_input = data[:, 3].astype(np.int32)
+    alpha_bits = np.zeros_like(alpha_input)
+    non_zero = alpha_input > 0
+    alpha_bits[non_zero] = np.floor(np.log2(alpha_input[non_zero])).astype(np.int32)
+    alpha_scale = np.where(alpha_input > 0, (1 << (alpha_bits + 1)) - 1, 1)
+    r = y + co - cg
+    g = y + cg
+    b = y - co - cg
+    a = alpha_input & (alpha_scale >> 1)
+    a = (a << 1) | (a & 1)
+    scale = max_int / alpha_scale.astype(np.float32)
+    data[:, 0] = np.rint(r * scale).clip(0, max_int).astype(np.uint16)
+    data[:, 1] = np.rint(g * scale).clip(0, max_int).astype(np.uint16)
+    data[:, 2] = np.rint(b * scale).clip(0, max_int).astype(np.uint16)
+    data[:, 3] = np.rint(a * scale).clip(0, max_int).astype(np.uint16)
 
 
 def decode_index_buffer(target: bytearray, count: int, byte_stride: int, source: bytes) -> None:
@@ -436,8 +433,8 @@ def decode_index_buffer(target: bytearray, count: int, byte_stride: int, source:
         pushfifo(edgefifo, a)
         decoded.extend((a, b, c))
 
-    fmt = "<" + ("H" if byte_stride == 2 else "I") * len(decoded)
-    target[:] = struct.pack(fmt, *decoded)
+    dtype = np.uint16 if byte_stride == 2 else np.uint32
+    target[:] = np.asarray(decoded, dtype=dtype).tobytes()
 
 
 def decode_index_sequence(target: bytearray, count: int, byte_stride: int, source: bytes) -> None:
@@ -467,8 +464,8 @@ def decode_index_sequence(target: bytearray, count: int, byte_stride: int, sourc
         last[bucket] += delta
         decoded.append(last[bucket])
 
-    fmt = "<" + ("H" if byte_stride == 2 else "I") * len(decoded)
-    target[:] = struct.pack(fmt, *decoded)
+    dtype = np.uint16 if byte_stride == 2 else np.uint32
+    target[:] = np.asarray(decoded, dtype=dtype).tobytes()
 
 
 def decode_gltf_buffer(count: int, size: int, source: bytes, mode: str, filter_name: str | None) -> bytes:
@@ -493,12 +490,12 @@ def read_resource(base_dir: Path, uri: str | None) -> bytes:
     return (base_dir / uri).read_bytes()
 
 
-def load_asset(input_path: Path) -> tuple[dict, list[bytearray], Path]:
+def load_asset(input_path: Path) -> MeshoptAsset:
     if input_path.suffix.lower() == ".gltf":
         json_doc = json.loads(input_path.read_text(encoding="utf-8"))
         base_dir = input_path.parent
         buffers = [bytearray(read_resource(base_dir, buffer_def.get("uri"))) for buffer_def in json_doc.get("buffers", [])]
-        return json_doc, buffers, base_dir
+        return MeshoptAsset(json_doc=json_doc, buffers=buffers, base_dir=base_dir)
 
     if input_path.suffix.lower() != ".glb":
         raise ValueError(f"Unsupported file type: {input_path.suffix.lower()}")
@@ -507,7 +504,8 @@ def load_asset(input_path: Path) -> tuple[dict, list[bytearray], Path]:
     if len(payload) < 20:
         raise ValueError(f"Invalid GLB header in {input_path}")
 
-    magic, version, _ = struct.unpack_from("<4sII", payload, 0)
+    magic = payload[:4]
+    version = int(np.frombuffer(payload[4:8], dtype=np.uint32)[0])
     if magic != b"glTF" or version != 2:
         raise ValueError(f"Invalid GLB header in {input_path}")
 
@@ -515,7 +513,9 @@ def load_asset(input_path: Path) -> tuple[dict, list[bytearray], Path]:
     json_chunk = None
     bin_chunk = b""
     while offset + 8 <= len(payload):
-        chunk_length, chunk_type = struct.unpack_from("<II", payload, offset)
+        chunk_header = np.frombuffer(payload[offset : offset + 8], dtype=np.uint32)
+        chunk_length = int(chunk_header[0])
+        chunk_type = int(chunk_header[1])
         chunk_data = payload[offset + 8 : offset + 8 + chunk_length]
         if chunk_type == GLB_JSON_CHUNK:
             json_chunk = chunk_data
@@ -535,7 +535,7 @@ def load_asset(input_path: Path) -> tuple[dict, list[bytearray], Path]:
             buffers.append(bytearray(bin_chunk))
         else:
             buffers.append(bytearray(buffer_def.get("byteLength", 0)))
-    return json_doc, buffers, input_path.parent
+    return MeshoptAsset(json_doc=json_doc, buffers=buffers, base_dir=input_path.parent)
 
 
 def decode_meshopt(json_doc: dict, buffers: list[bytearray]) -> None:
@@ -601,10 +601,16 @@ def write_asset(output_path: Path, json_doc: dict, buffers: list[bytearray]) -> 
 
 
 def decode_file(input_path: Path, output_path: Path) -> Path:
-    json_doc, buffers, _ = load_asset(input_path)
-    decode_meshopt(json_doc, buffers)
-    write_asset(output_path, json_doc, buffers)
+    asset = load_asset(input_path)
+    decode_meshopt(asset.json_doc, asset.buffers)
+    write_asset(output_path, asset.json_doc, asset.buffers)
     return output_path
+
+
+def decode_asset(input_path: Path) -> MeshoptAsset:
+    asset = load_asset(input_path)
+    decode_meshopt(asset.json_doc, asset.buffers)
+    return asset
 
 
 def main(argv: list[str]) -> int:

@@ -7,7 +7,7 @@ import struct
 import bpy
 
 from . import standalone_gltf
-from .scripts.decode_meshopt import decode_file as decode_meshopt_file
+from .scripts.decode_meshopt import decode_asset as decode_meshopt_asset
 
 
 def get_classes(modules: tuple[Any]) -> tuple[type]:
@@ -58,8 +58,17 @@ def check_integrity(path: Path) -> None:
         raise FileNotFoundError("Incorrect package, follow installation guide")
 
 
-def run_meshopt_decoder(input_path: Path, output_path: Path) -> None:
-    decode_meshopt_file(input_path, output_path)
+def decode_meshopt_for_import(input_path: Path) -> standalone_gltf.GLTFDocument:
+    asset = decode_meshopt_asset(input_path)
+    return standalone_gltf.GLTFDocument(
+        json_data=asset.json_doc,
+        buffers=asset.buffers,
+        base_dir=asset.base_dir,
+    )
+
+
+def normalize_document_for_import(document: standalone_gltf.GLTFDocument, output_path: Path) -> Path:
+    return standalone_gltf.normalize_document_for_import(document, output_path)
 
 
 def _load_gltf_json(input_path: Path) -> dict[str, Any]:
@@ -144,8 +153,7 @@ def normalize_model_for_import(input_path: Path, output_path: Path) -> Path:
         return standalone_gltf.normalize_model_for_import(input_path, output_path)
 
     if "EXT_meshopt_compression" in extensions:
-        decoded_path = output_path.with_name(f"{output_path.stem}_meshopt_decoded.gltf")
-        run_meshopt_decoder(input_path, decoded_path)
-        return standalone_gltf.normalize_model_for_import(decoded_path, output_path)
+        decoded_document = decode_meshopt_for_import(input_path)
+        return standalone_gltf.normalize_document_for_import(decoded_document, output_path)
 
     raise RuntimeError("Draco-compressed files are not supported by this addon.")

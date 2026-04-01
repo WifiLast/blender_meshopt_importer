@@ -40,6 +40,10 @@ class IMPORT_SCENE_OT_dequantize_gltf(Operator, ImportHelper):
         if self._worker is not None and self._worker.is_alive():
             return {"RUNNING_MODAL"}
 
+        if self._error is None and self._stage == "meshopt_decode":
+            self._start_normalize_stage()
+            return {"RUNNING_MODAL"}
+
         self._finish(context)
         return self._result
 
@@ -65,24 +69,51 @@ class IMPORT_SCENE_OT_dequantize_gltf(Operator, ImportHelper):
         self._temp_dir = temp_dir
         self._normalized_path = normalized_path
         self._import_path = normalized_path
+        self._source_path = source_path
+        self._decoded_document = None
+        self._needs_meshopt_decode = "EXT_meshopt_compression" in extensions
         self._error = None
         self._result = {"RUNNING_MODAL"}
-        self._worker = threading.Thread(
-            target=self._normalize_in_background,
-            args=(source_path, normalized_path),
-            daemon=True,
-        )
         self._timer = context.window_manager.event_timer_add(0.2, window=context.window)
         context.window_manager.modal_handler_add(self)
-        self._worker.start()
         self.report({"INFO"}, f"Preparing {source_path.name} ({compression_label}) with {self._display_name}...")
+        if self._needs_meshopt_decode:
+            self._start_worker(
+                "meshopt_decode",
+                "Decoding Meshopt geometry...",
+                "_decoded_document",
+                essentials.decode_meshopt_for_import,
+                source_path,
+            )
+        else:
+            self._start_normalize_stage()
         return {"RUNNING_MODAL"}
 
-    def _normalize_in_background(self, source_path, normalized_path):
+    def _run_stage(self, result_attr, task, *args):
         try:
-            self._import_path = essentials.normalize_model_for_import(source_path, normalized_path)
+            setattr(self, result_attr, task(*args))
         except Exception as exc:
             self._error = str(exc)
+
+    def _start_worker(self, stage, report_message, result_attr, task, *args):
+        self._stage = stage
+        self._worker = threading.Thread(
+            target=self._run_stage,
+            args=(result_attr, task, *args),
+            daemon=True,
+        )
+        self._worker.start()
+        self.report({"INFO"}, report_message)
+
+    def _start_normalize_stage(self):
+        self._start_worker(
+            "normalize",
+            "Dequantizing and de-duplicating geometry...",
+            "_import_path",
+            essentials.normalize_document_for_import if self._needs_meshopt_decode else essentials.normalize_model_for_import,
+            self._decoded_document if self._needs_meshopt_decode else self._source_path,
+            self._normalized_path,
+        )
 
     def _finish(self, context):
         if self._timer is not None:
