@@ -13,8 +13,8 @@ from .. import essentials
 
 class IMPORT_SCENE_OT_dequantize_gltf(Operator, ImportHelper):
     bl_idname = "import_scene.dequantize_gltf"
-    bl_label = "Import GLTF/GLB (Meshopt)"
-    bl_description = "Normalize Meshopt and quantized geometry before importing"
+    bl_label = "glTF 2.0 (.glb/.gltf) With Meshopt"
+    bl_description = "Extend Blender's glTF import with Meshopt and quantized geometry support"
     bl_options = {"REGISTER", "UNDO"}
 
     filename_ext = ".glb"
@@ -28,8 +28,14 @@ class IMPORT_SCENE_OT_dequantize_gltf(Operator, ImportHelper):
         default=False,
     )
 
+    def draw(self, context):
+        layout = self.layout
+        layout.prop(self, "keep_dequantized_file")
+        layout.label(text="Meshopt decode: standalone Python", icon="TOOL_SETTINGS")
+        layout.label(text="Dequantize/dedup: standalone Python", icon="TOOL_SETTINGS")
+        layout.label(text="Draco: unsupported", icon="INFO")
+
     def invoke(self, context, event):
-        self.keep_dequantized_file = context.scene.decompress_draco_meshotp.keep_dequantized_file
         context.window_manager.fileselect_add(self)
         return {"RUNNING_MODAL"}
 
