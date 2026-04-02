@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 id = "model_decompressor"
 name = "Compressed GLB Importer"
-version = "0.0.1"
+version = "0.0.3"
 tagline = "Import Meshopt and quantized GLB models with standalone Python"
 maintainer = "Wiffzackius"
 type = "add-on"
