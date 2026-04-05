@@ -6,6 +6,7 @@ import base64
 import json
 import math
 import sys
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -27,16 +28,6 @@ class MeshoptAsset:
 def assert_true(condition: bool, message: str = "Assertion failed") -> None:
     if not condition:
         raise ValueError(message)
-
-
-def dezig(value: int) -> int:
-    return ~(value >> 1) if (value & 1) != 0 else value >> 1
-
-
-def pushfifo(fifo: list[int], value: int) -> None:
-    for index in range(len(fifo) - 1, 0, -1):
-        fifo[index] = fifo[index - 1]
-    fifo[0] = value
 
 
 def decode_vertex_buffer(target: bytearray, element_count: int, byte_stride: int, source: bytes, filter_name: str | None) -> None:
@@ -138,17 +129,19 @@ def decode_vertex_buffer(target: bytearray, element_count: int, byte_stride: int
 
                 if channel_mode == 0:
                     for byte in range(byte_group, byte_group + 4):
-                        delta = dezig(deltas[byte * attr_block_element_count + elem])
+                        val = deltas[byte * attr_block_element_count + elem]
+                        delta = (val >> 1) ^ -(val & 1)
                         temp = (temp_data[byte] + delta) & 0xFF
                         dst_offset = dst_elem * byte_stride + byte
                         target[dst_offset] = temp
                         temp_data[byte] = temp
                 elif channel_mode == 1:
                     for byte in range(byte_group, byte_group + 4, 2):
-                        delta = dezig(
+                        val = (
                             deltas[byte * attr_block_element_count + elem]
                             + (deltas[(byte + 1) * attr_block_element_count + elem] << 8)
                         )
+                        delta = (val >> 1) ^ -(val & 1)
                         temp = temp_data[byte] + (temp_data[byte + 1] << 8)
                         temp = (temp + delta) & 0xFFFF
                         dst_offset = dst_elem * byte_stride + byte
@@ -330,13 +323,13 @@ def decode_index_buffer(target: bytearray, count: int, byte_stride: int, source:
 
     next_index = 0
     last = 0
-    edgefifo = [0] * 32
-    vertexfifo = [0] * 16
+    edgefifo = deque([0] * 32, maxlen=32)
+    vertexfifo = deque([0] * 16, maxlen=16)
     decoded: list[int] = []
 
     def decode_index(value: int) -> int:
         nonlocal last
-        last += dezig(value)
+        last += (value >> 1) ^ -(value & 1)
         return last
 
     for _ in range(tri_count):
@@ -351,25 +344,25 @@ def decode_index_buffer(target: bytearray, count: int, byte_stride: int, source:
             if b1 == 0x00:
                 c = next_index
                 next_index += 1
-                pushfifo(vertexfifo, c)
+                vertexfifo.appendleft(c)
             elif b1 < 0x0D:
                 c = vertexfifo[b1]
             elif b1 == 0x0D:
                 last -= 1
                 c = last
-                pushfifo(vertexfifo, c)
+                vertexfifo.appendleft(c)
             elif b1 == 0x0E:
                 last += 1
                 c = last
-                pushfifo(vertexfifo, c)
+                vertexfifo.appendleft(c)
             else:
                 c = decode_index(read_leb128())
-                pushfifo(vertexfifo, c)
+                vertexfifo.appendleft(c)
 
-            pushfifo(edgefifo, b)
-            pushfifo(edgefifo, c)
-            pushfifo(edgefifo, c)
-            pushfifo(edgefifo, a)
+            edgefifo.appendleft(b)
+            edgefifo.appendleft(c)
+            edgefifo.appendleft(c)
+            edgefifo.appendleft(a)
             decoded.extend((a, b, c))
             continue
 
@@ -385,11 +378,11 @@ def decode_index_buffer(target: bytearray, count: int, byte_stride: int, source:
             c = next_index if w == 0x00 else vertexfifo[w - 1]
             if w == 0x00:
                 next_index += 1
-            pushfifo(vertexfifo, a)
+            vertexfifo.appendleft(a)
             if z == 0x00:
-                pushfifo(vertexfifo, b)
+                vertexfifo.appendleft(b)
             if w == 0x00:
-                pushfifo(vertexfifo, c)
+                vertexfifo.appendleft(c)
         else:
             e = source[data_offset]
             data_offset += 1
@@ -419,18 +412,18 @@ def decode_index_buffer(target: bytearray, count: int, byte_stride: int, source:
             else:
                 c = vertexfifo[w - 1]
 
-            pushfifo(vertexfifo, a)
+            vertexfifo.appendleft(a)
             if z in (0x00, 0x0F):
-                pushfifo(vertexfifo, b)
+                vertexfifo.appendleft(b)
             if w in (0x00, 0x0F):
-                pushfifo(vertexfifo, c)
+                vertexfifo.appendleft(c)
 
-        pushfifo(edgefifo, a)
-        pushfifo(edgefifo, b)
-        pushfifo(edgefifo, b)
-        pushfifo(edgefifo, c)
-        pushfifo(edgefifo, c)
-        pushfifo(edgefifo, a)
+        edgefifo.appendleft(a)
+        edgefifo.appendleft(b)
+        edgefifo.appendleft(b)
+        edgefifo.appendleft(c)
+        edgefifo.appendleft(c)
+        edgefifo.appendleft(a)
         decoded.extend((a, b, c))
 
     dtype = np.uint16 if byte_stride == 2 else np.uint32
@@ -460,7 +453,8 @@ def decode_index_sequence(target: bytearray, count: int, byte_stride: int, sourc
     for _ in range(count):
         value = read_leb128()
         bucket = value & 0x01
-        delta = dezig(value >> 1)
+        val = value >> 1
+        delta = (val >> 1) ^ -(val & 1)
         last[bucket] += delta
         decoded.append(last[bucket])
 

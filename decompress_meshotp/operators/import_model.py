@@ -1,7 +1,6 @@
 from pathlib import Path
 import shutil
 import tempfile
-import threading
 
 import bpy
 from bpy.props import BoolProperty, StringProperty
@@ -43,11 +42,26 @@ class IMPORT_SCENE_OT_dequantize_gltf(Operator, ImportHelper):
         if event.type != "TIMER":
             return {"PASS_THROUGH"}
 
-        if self._worker is not None and self._worker.is_alive():
+        if self._stage == "meshopt_decode_pending":
+            self._run_stage(
+                "_decoded_document",
+                essentials.decode_meshopt_for_import,
+                self._source_path,
+            )
+            if self._error is None:
+                self.report({"INFO"}, "Dequantizing and de-duplicating geometry...")
+                self._stage = "normalize_pending"
             return {"RUNNING_MODAL"}
 
-        if self._error is None and self._stage == "meshopt_decode":
-            self._start_normalize_stage()
+        if self._stage == "normalize_pending":
+            self._run_stage(
+                "_import_path",
+                essentials.normalize_document_for_import if self._needs_meshopt_decode else essentials.normalize_model_for_import,
+                self._decoded_document if self._needs_meshopt_decode else self._source_path,
+                self._normalized_path,
+            )
+            if self._error is None:
+                self._stage = "import_pending"
             return {"RUNNING_MODAL"}
 
         self._finish(context)
@@ -80,19 +94,14 @@ class IMPORT_SCENE_OT_dequantize_gltf(Operator, ImportHelper):
         self._needs_meshopt_decode = "EXT_meshopt_compression" in extensions
         self._error = None
         self._result = {"RUNNING_MODAL"}
+        self._stage = "meshopt_decode_pending" if self._needs_meshopt_decode else "normalize_pending"
         self._timer = context.window_manager.event_timer_add(0.2, window=context.window)
         context.window_manager.modal_handler_add(self)
         self.report({"INFO"}, f"Preparing {source_path.name} ({compression_label}) with {self._display_name}...")
         if self._needs_meshopt_decode:
-            self._start_worker(
-                "meshopt_decode",
-                "Decoding Meshopt geometry...",
-                "_decoded_document",
-                essentials.decode_meshopt_for_import,
-                source_path,
-            )
+            self.report({"INFO"}, "Decoding Meshopt geometry...")
         else:
-            self._start_normalize_stage()
+            self.report({"INFO"}, "Dequantizing and de-duplicating geometry...")
         return {"RUNNING_MODAL"}
 
     def _run_stage(self, result_attr, task, *args):
@@ -100,26 +109,6 @@ class IMPORT_SCENE_OT_dequantize_gltf(Operator, ImportHelper):
             setattr(self, result_attr, task(*args))
         except Exception as exc:
             self._error = str(exc)
-
-    def _start_worker(self, stage, report_message, result_attr, task, *args):
-        self._stage = stage
-        self._worker = threading.Thread(
-            target=self._run_stage,
-            args=(result_attr, task, *args),
-            daemon=True,
-        )
-        self._worker.start()
-        self.report({"INFO"}, report_message)
-
-    def _start_normalize_stage(self):
-        self._start_worker(
-            "normalize",
-            "Dequantizing and de-duplicating geometry...",
-            "_import_path",
-            essentials.normalize_document_for_import if self._needs_meshopt_decode else essentials.normalize_model_for_import,
-            self._decoded_document if self._needs_meshopt_decode else self._source_path,
-            self._normalized_path,
-        )
 
     def _finish(self, context):
         if self._timer is not None:
